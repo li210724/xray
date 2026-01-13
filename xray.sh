@@ -1,187 +1,218 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
+export LANG=en_US.UTF-8
 
-# ==========================================================
-# RV - VLESS TCP REALITY Vision (One-click, non-interactive)
+# ============================================================
+# xray.sh — VLESS TCP REALITY Vision 一键脚本（自用向）
 #
-# Default:
-#   SNI = www.tesla.com
-#   Port = random (20000-60000)
-#   UUID = random
-#   Fingerprint = chrome
+# 目标：
+#   - 一条命令部署 VLESS + TCP + REALITY + Vision
+#   - 输出 vless 分享链接（客户端直接导入）
+#   - systemd 管理 xray.service
 #
-# Run:
-#   bash xray.sh
+# 设计原则：
+#   - 非交互：避免“菜单乱码 / 复制粘贴失效 / curl 返回 HTML 误执行”等问题
+#   - 稳定优先：只做必要动作，不碰复杂防火墙规则
 #
-# Optional env:
-#   reym=www.tesla.com        # SNI/伪装域名
-#   vlpt=443                  # 端口(留空随机)
-#   uuid=xxxx                 # UUID(留空随机)
-#   fp=chrome                 # 指纹(默认 chrome)
-#   bbr=1                     # 额外开启 BBR+fq（可选）
+# 命令：
+#   bash xray.sh              # 默认 install（安装/重装）
+#   bash xray.sh install      # 安装/重装
+#   bash xray.sh info         # 输出节点信息（链接/参数）
+#   bash xray.sh status       # 查看服务状态
+#   bash xray.sh log          # 最近 200 行日志
+#   bash xray.sh update       # 仅更新 Xray 内核（不改配置，客户端不用重配）
+#   bash xray.sh bbr          # 单独开启 BBR + fq
+#   bash xray.sh uninstall    # 卸载 Xray 并清理配置
 #
-# Commands:
-#   bash xray.sh              # install/reinstall & print info
-#   bash xray.sh info         # print info only
-#   bash xray.sh status       # systemd status
-#   bash xray.sh log          # last 200 logs
-#   bash xray.sh uninstall    # remove xray + clean
-# ==========================================================
+# 可选环境变量（安装时生效）：
+#   reym=www.tesla.com   # Reality 伪装域名（SNI，默认特斯拉）
+#   vlpt=443            # 固定端口（不填随机）
+#   uuid=xxxx           # 固定 UUID（不填自动生成）
+#   fp=chrome           # 指纹（默认 chrome）
+#   bbr=1               # 安装时同时开启 BBR + fq
+# ============================================================
 
-ENV_FILE="/root/reality_vision.env"
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_CONF="/usr/local/etc/xray/config.json"
+# -------------------- 路径与默认值 --------------------
+XRAY_BIN="/usr/local/bin/xray"                # 官方脚本默认安装位置
+XRAY_CONF="/usr/local/etc/xray/config.json"   # 官方建议配置目录
+ENV_FILE="/root/reality_vision.env"           # 保存生成出来的节点参数，方便 info 重复输出
 SERVICE="xray"
 
-REYM_DEFAULT="www.tesla.com"
-FP_DEFAULT="chrome"
-PORT_MIN=20000
+REYM_DEFAULT="www.tesla.com"                  # 默认伪装域名（SNI）
+PORT_MIN=20000                                # 默认随机端口范围（避开常见端口）
 PORT_MAX=60000
 
-die(){ echo "ERROR: $*" >&2; exit 1; }
-is_root(){ [[ "${EUID:-0}" -eq 0 ]]; }
+# -------------------- 基础判断 --------------------
+is_root() { [[ "${EUID}" -eq 0 ]]; }
 
-need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
+# 判断端口是否被占用（TCP LISTEN）
+# - free 返回 0
+# - 占用返回 1
+is_port_free() {
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$" && return 1 || return 0
+}
 
+# ============================================================
+# 1) 公网 IP 获取（NAT 机器更友好）
+# ------------------------------------------------------------
+# 说明：
+# - 有些机器是 NAT / 多网卡，直接读取本机 IP 不可靠
+# - 用外部服务探测“从公网看到的出口 IP”
+# - 优先 IPv4，失败再兜底其它接口
+# - 若探测到 IPv6，为了符合 URL 格式，返回时加 []
+# ============================================================
+get_public_ip() {
+  local ip=""
+  ip="$(curl -4 -s --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -s --max-time 3 https://icanhazip.com 2>/dev/null | tr -d '\n' || true)"
+  [[ -z "$ip" ]] && ip="$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null | tr -d '\n' || true)"
+
+  if [[ "$ip" == *:* ]]; then
+    echo "[$ip]"
+  else
+    echo "$ip"
+  fi
+}
+
+# ============================================================
+# 2) 防火墙检测与放行（只处理常见的 ufw/firewalld）
+# ------------------------------------------------------------
+# 说明：
+# - NS 用户里 Debian/Ubuntu 常见 ufw
+# - CentOS/RHEL 系常见 firewalld
+# - nftables/iptables 不强行改（避免误伤已有规则）
+# ============================================================
+open_firewall_port() {
+  local port="$1"
+
+  # UFW
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "active"; then
+    echo "==> ufw 已启用，放行 TCP ${port}"
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+  fi
+
+  # firewalld
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    echo "==> firewalld 已启用，放行 TCP ${port}"
+    firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+# ============================================================
+# 3) BBR + fq（可选）
+# ------------------------------------------------------------
+# 说明：
+# - fq 作为 default_qdisc
+# - bbr 作为拥塞控制算法
+# - 写入 /etc/sysctl.d/99-bbr.conf，重启也有效
+# ============================================================
+enable_bbr() {
+  echo "==> 开启 BBR + fq..."
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+
+  cat > /etc/sysctl.d/99-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+  sysctl --system >/dev/null
+  echo "==> 当前内核参数："
+  sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+}
+
+# ============================================================
+# 4) 安装依赖 & 安装 Xray
+# ------------------------------------------------------------
+# 说明：
+# - 使用 XTLS 官方 install-release.sh
+# - 你的 config.json 是脚本写入的，不会被 update 覆盖
+# ============================================================
 install_deps() {
   echo "==> 安装依赖..."
-  export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null
-  apt-get install -y curl unzip openssl ca-certificates iproute2 coreutils >/dev/null
+  apt-get install -y curl unzip openssl ca-certificates iproute2 >/dev/null
 }
 
 install_xray() {
-  echo "==> 安装/更新官方 Xray..."
-  # 官方安装脚本：安装/更新
-  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/dev/null
-  [[ -x "$XRAY_BIN" ]] || die "Xray 安装失败：找不到 $XRAY_BIN"
+  echo "==> 安装/更新 Xray（官方脚本）..."
+  bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/dev/null
+  [[ -x "$XRAY_BIN" ]] || { echo "Xray 安装失败：未找到 $XRAY_BIN"; exit 1; }
 }
 
-stop_conflicts() {
-  # 如果你装过 Argosbx，它可能有 xr.service / /root/agsbx/xray
-  echo "==> 停止可能冲突的服务(如存在)..."
-  systemctl stop xr 2>/dev/null || true
-  systemctl disable xr 2>/dev/null || true
-  pkill -f "/root/agsbx/xray" 2>/dev/null || true
-}
-
-is_port_free() {
-  # free => 0, used => 1
-  ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$" && return 1 || return 0
+# ============================================================
+# 5) 生成 UUID / 选择端口 / 生成 Reality 密钥
+# ============================================================
+gen_uuid() {
+  # uuid=xxx 可自定义；否则随机生成
+  UUID="${uuid:-$(cat /proc/sys/kernel/random/uuid)}"
 }
 
 choose_port() {
   if [[ -n "${vlpt:-}" ]]; then
     PORT="$vlpt"
-    is_port_free "$PORT" || die "端口 $PORT 被占用，请换：vlpt=38443 bash xray.sh"
-    return
-  fi
-  for _ in $(seq 1 180); do
-    PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
-    is_port_free "$PORT" && return
-  done
-  die "随机端口选择失败，请手动指定：vlpt=xxxxx"
-}
-
-gen_uuid() {
-  if [[ -n "${uuid:-}" ]]; then
-    UUID="$uuid"
+    is_port_free "$PORT" || { echo "端口被占用：$PORT"; exit 1; }
   else
-    UUID="$(cat /proc/sys/kernel/random/uuid)"
+    # 随机端口，最多尝试 100 次
+    for _ in $(seq 1 100); do
+      PORT="$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)"
+      is_port_free "$PORT" && break
+    done
+    is_port_free "$PORT" || { echo "随机端口选择失败，请手动指定 vlpt=xxxxx"; exit 1; }
   fi
 }
 
 gen_reality_keys() {
-  echo "==> 生成 Reality x25519 密钥对..."
-  local KEYS PRIVATE_KEY PUBLIC_KEY
-  KEYS="$("$XRAY_BIN" x25519 2>/dev/null || true)"
+  echo "==> 生成 Reality 密钥对..."
+  local out
+  out="$("$XRAY_BIN" x25519)"
 
-  # 兼容两种输出：
-  # 新：PrivateKey: xxx  Password: yyy
-  # 旧：Private key: xxx Public key: yyy
-  PRIVATE_KEY="$(echo "$KEYS" | awk -F'[: ]+' '/PrivateKey|Private key/ {print $2; exit}')"
-  PUBLIC_KEY="$(echo "$KEYS"  | awk -F'[: ]+' '/Password|Public key/ {print $2; exit}')"
+  # Xray 输出格式可能随版本略变，这里做兼容
+  PRIVATE_KEY="$(echo "$out" | awk -F'[: ]+' '/PrivateKey|Private key/ {print $2; exit}')"
+  PUBLIC_KEY="$(echo "$out" | awk -F'[: ]+' '/Password|Public key/ {print $2; exit}')"
 
-  [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || {
-    echo "密钥生成/解析失败，输出如下："
-    echo "$KEYS"
-    die "请确认 Xray 可执行 & 版本正常"
-  }
+  [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || { echo "密钥解析失败：$out"; exit 1; }
 
-  PRIVATE_KEY_R="$PRIVATE_KEY"
-  PUBLIC_KEY_R="$PUBLIC_KEY"
+  # ShortID 规则：一般用 8位 hex（4 bytes）
   SHORT_ID="$(openssl rand -hex 4)"
 }
 
-get_public_ip() {
-  curl -s --max-time 3 https://api.ipify.org || true
-}
-
+# ============================================================
+# 6) 写入 Xray 配置（VLESS TCP REALITY Vision）
+# ------------------------------------------------------------
+# 说明：
+# - 监听 ::（双栈），多数情况下同时覆盖 v4/v6
+# - flow: xtls-rprx-vision
+# - security: reality
+# - dest: SNI:443
+# ============================================================
 write_config() {
-  echo "==> 写入配置..."
   mkdir -p "$(dirname "$XRAY_CONF")"
 
   cat > "$XRAY_CONF" <<JSON
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "listen": "0.0.0.0",
-      "port": ${PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          { "id": "${UUID}", "flow": "xtls-rprx-vision" }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${SNI}:443",
-          "xver": 0,
-          "serverNames": ["${SNI}"],
-          "privateKey": "${PRIVATE_KEY_R}",
-          "shortIds": ["${SHORT_ID}"]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http","tls","quic"]
-      }
+  "inbounds": [{
+    "listen": "::",
+    "port": $PORT,
+    "protocol": "vless",
+    "settings": {
+      "clients": [
+        { "id": "$UUID", "flow": "xtls-rprx-vision" }
+      ],
+      "decryption": "none"
     },
-    {
-      "listen": "::",
-      "port": ${PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          { "id": "${UUID}", "flow": "xtls-rprx-vision" }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${SNI}:443",
-          "xver": 0,
-          "serverNames": ["${SNI}"],
-          "privateKey": "${PRIVATE_KEY_R}",
-          "shortIds": ["${SHORT_ID}"]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http","tls","quic"]
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "dest": "$SNI:443",
+        "serverNames": ["$SNI"],
+        "privateKey": "$PRIVATE_KEY",
+        "shortIds": ["$SHORT_ID"]
       }
     }
-  ],
+  }],
   "outbounds": [
     { "protocol": "freedom" }
   ]
@@ -192,153 +223,134 @@ JSON
   "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null
 }
 
-start_service() {
-  echo "==> 启动 Xray..."
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE"
-  systemctl --no-pager -l status "$SERVICE" | sed -n '1,14p'
-}
-
+# 保存生成信息，方便 `info` 重复输出
 save_env() {
-  umask 077
-  cat > "$ENV_FILE" <<ENV
-# Auto-generated. Edit if you know what you're doing.
-SERVER_IP=${SERVER_IP}
-PORT=${PORT}
-UUID=${UUID}
-SNI=${SNI}
-FP=${FP}
-PUBLIC_KEY=${PUBLIC_KEY_R}
-SHORT_ID=${SHORT_ID}
-ENV
-  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  cat > "$ENV_FILE" <<EOF
+SERVER_IP=$SERVER_IP
+PORT=$PORT
+UUID=$UUID
+SNI=$SNI
+FP=$FP
+PUBLIC_KEY=$PUBLIC_KEY
+SHORT_ID=$SHORT_ID
+EOF
+  chmod 600 "$ENV_FILE" >/dev/null 2>&1 || true
 }
 
-load_env() {
-  [[ -f "$ENV_FILE" ]] && # shellcheck disable=SC1090
-  source "$ENV_FILE"
-}
-
+# 输出分享链接（最常用）
 print_info() {
-  load_env
-  [[ -n "${PORT:-}" && -n "${UUID:-}" && -n "${PUBLIC_KEY:-}" && -n "${SHORT_ID:-}" && -n "${SNI:-}" ]] \
-    || die "没有找到已保存的节点信息：$ENV_FILE（先运行：bash xray.sh）"
-
-  local NAME="RV-Tesla-Vision"
-  local SERVER="${SERVER_IP:-YOUR_VPS_IP}"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE" 2>/dev/null || { echo "未找到节点信息：$ENV_FILE（先 install）"; exit 1; }
 
   echo
   echo "================= 节点信息 ================="
-  echo "服务器IP      : ${SERVER}"
-  echo "端口(PORT)     : ${PORT}"
-  echo "UUID           : ${UUID}"
-  echo "SNI(伪装域名)  : ${SNI}"
-  echo "PublicKey(pbk) : ${PUBLIC_KEY}"
-  echo "ShortID(sid)   : ${SHORT_ID}"
-  echo "Fingerprint    : ${FP:-chrome}"
+  echo "服务器IP  : $SERVER_IP"
+  echo "端口      : $PORT"
+  echo "UUID      : $UUID"
+  echo "SNI       : $SNI"
+  echo "PublicKey : $PUBLIC_KEY"
+  echo "ShortID   : $SHORT_ID"
+  echo "Fingerprint: $FP"
   echo "==========================================="
   echo
+
   echo "vless 分享链接："
-  echo "vless://${UUID}@${SERVER}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FP:-chrome}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${NAME}"
+  echo "vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#RV-Tesla-Vision"
   echo
-  echo "Clash Meta 片段："
-  cat <<YAML
-proxies:
-  - name: ${NAME}
-    type: vless
-    server: ${SERVER}
-    port: ${PORT}
-    uuid: ${UUID}
-    network: tcp
-    tls: true
-    flow: xtls-rprx-vision
-    servername: ${SNI}
-    reality-opts:
-      public-key: ${PUBLIC_KEY}
-      short-id: ${SHORT_ID}
-    udp: true
-YAML
-  echo
-  echo "注意：请确保云安全组/防火墙已放行 TCP ${PORT}"
 }
 
-enable_bbr_fq() {
-  echo "==> 开启 BBR + fq..."
-  modprobe tcp_bbr 2>/dev/null || true
-  mkdir -p /etc/sysctl.d
-  cat > /etc/sysctl.d/99-bbr-fq.conf <<CONF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-CONF
-  sysctl --system >/dev/null || true
-  echo "==> 当前参数："
-  sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true
-  sysctl -n net.core.default_qdisc 2>/dev/null || true
-}
-
+# ============================================================
+# 7) 主命令实现
+# ============================================================
 cmd_install() {
-  is_root || die "请用 root 运行"
-  need_cmd systemctl
+  is_root || { echo "请用 root 运行"; exit 1; }
+
   install_deps
   install_xray
-  stop_conflicts
 
+  # 安装参数（可通过环境变量覆盖）
   SNI="${reym:-$REYM_DEFAULT}"
-  FP="${fp:-$FP_DEFAULT}"
+  FP="${fp:-chrome}"
 
   gen_uuid
   choose_port
   gen_reality_keys
 
   SERVER_IP="$(get_public_ip)"
-  write_config
-  start_service
-  save_env
 
-  if [[ "${bbr:-0}" == "1" ]]; then
-    enable_bbr_fq
+  # 如果 NAT 或探测失败，提示用户自行改
+  if [[ -z "$SERVER_IP" ]]; then
+    SERVER_IP="YOUR_PUBLIC_IP_OR_DOMAIN"
+    echo "==> 提示：未自动获取公网 IP（可能是 NAT），请在输出链接里替换为你的入口 IP/域名"
   fi
 
-  echo
-  echo "==> 安装完成，信息已保存：$ENV_FILE"
+  write_config
+
+  echo "==> 启动 Xray..."
+  systemctl enable "$SERVICE" >/dev/null
+  systemctl restart "$SERVICE"
+
+  # 自动放行端口（仅处理 ufw / firewalld）
+  open_firewall_port "$PORT"
+
+  # 安装时可选开启 bbr
+  [[ "${bbr:-0}" == "1" ]] && enable_bbr
+
+  save_env
   print_info
 }
 
+cmd_update() {
+  is_root || { echo "请用 root 运行"; exit 1; }
+
+  echo "==> 更新 Xray 内核（不改配置）..."
+  bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/dev/null
+
+  echo "==> 重启服务..."
+  systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+
+  echo "==> 当前版本："
+  "$XRAY_BIN" version | head -n 1 || true
+
+  echo "==> 完成（配置未变，客户端无需重配）"
+}
+
 cmd_uninstall() {
-  is_root || die "请用 root 运行"
-  echo "==> 停止服务..."
+  is_root || { echo "请用 root 运行"; exit 1; }
+
+  echo "==> 停止并禁用服务..."
   systemctl stop "$SERVICE" 2>/dev/null || true
   systemctl disable "$SERVICE" 2>/dev/null || true
 
-  echo "==> 清理配置..."
+  echo "==> 清理配置与环境信息..."
   rm -f "$XRAY_CONF" "$ENV_FILE"
 
   echo "==> 卸载 Xray..."
-  # 正确卸载方式（你之前已经验证过）：pipe + bash -s -- remove
-  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- remove || true
+  bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) --remove || true
 
-  echo "==> 卸载完成"
+  echo "已卸载完成"
 }
 
-case "${1:-}" in
-  "" )        cmd_install ;;
-  install)    cmd_install ;;
-  info)       print_info ;;
-  status)     systemctl --no-pager -l status "$SERVICE" ;;
-  log)        journalctl -u "$SERVICE" --no-pager -n 200 ;;
-  bbr)        is_root || die "请用 root 运行"; enable_bbr_fq ;;
-  uninstall)  cmd_uninstall ;;
+# 默认不传参就 install，符合“一键生成”使用习惯
+case "${1:-install}" in
+  install)   cmd_install ;;
+  info)      print_info ;;
+  status)    systemctl --no-pager -l status "$SERVICE" ;;
+  log)       journalctl -u "$SERVICE" --no-pager -n 200 ;;
+  update)    cmd_update ;;
+  bbr)       enable_bbr ;;
+  uninstall) cmd_uninstall ;;
   *)
     echo "用法："
-    echo "  bash xray.sh              # 一键安装/重装并输出信息"
-    echo "  bash xray.sh info         # 仅输出节点信息"
-    echo "  bash xray.sh status       # 查看服务状态"
-    echo "  bash xray.sh log          # 查看最近200行日志"
-    echo "  bbr=1 bash xray.sh        # 安装时顺便开启 BBR+fq"
-    echo "  bash xray.sh bbr          # 单独开启 BBR+fq"
+    echo "  bash xray.sh install      # 一键安装/重装"
+    echo "  bash xray.sh info         # 输出节点信息"
+    echo "  bash xray.sh status       # 查看状态"
+    echo "  bash xray.sh log          # 查看日志"
+    echo "  bash xray.sh update       # 更新内核（不改配置）"
+    echo "  bash xray.sh bbr          # 开启 BBR + fq"
     echo "  bash xray.sh uninstall    # 卸载"
     echo
     echo "可选变量："
-    echo "  reym=www.tesla.com vlpt=443 uuid=xxx fp=chrome bash xray.sh"
+    echo "  reym=www.tesla.com vlpt=443 uuid=xxx fp=chrome bbr=1 bash xray.sh install"
     ;;
 esac
