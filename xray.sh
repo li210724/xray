@@ -20,10 +20,10 @@ export LC_ALL=C.UTF-8
 #   vlpt=443                  # 端口(留空随机)
 #   uuid=xxxx                 # UUID(留空随机)
 #   fp=chrome                 # 指纹(默认 chrome)
-#   bbr=1                     # 额外开启 BBR+fq（可选）
-#   openfw=1                  # 自动放行防火墙端口（可选）
-#   dry=1                     # dry-run（仅打印将执行动作）
+#   bbr=1                     # 安装时顺便开启 BBR+fq（可选）
+#   openfw=1                  # 尝试自动放行防火墙端口（可选）
 #   gh_proxy=https://xxx/     # GitHub raw 代理前缀（可选）
+#   dry=1                     # dry-run（仅打印将执行动作，不改系统）
 #
 # Commands:
 #   bash xray.sh              # install/reinstall & print info
@@ -51,6 +51,9 @@ REYM_DEFAULT="www.tesla.com"
 FP_DEFAULT="chrome"
 PORT_MIN=20000
 PORT_MAX=60000
+
+# ✅ Xray 官方安装脚本正确 raw 地址（修复 404 根因）
+XRAY_INSTALL_RAW_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
 
 DRY_RUN="${dry:-0}"
 
@@ -93,29 +96,13 @@ valid_sni() {
   return 0
 }
 
-# ---------- robust fetch helpers ----------
-
-curl_fetch() {
-  # curl_fetch <url> <out_file>
-  # extra stable: retry + timeout + follow redirect
-  local url="$1" out="$2"
-  local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
-
-  if [[ "$DRY_RUN" == "1" ]]; then
-    echo "[dry-run] curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 5 --max-time 25 -A '$ua' '$url' -o '$out'"
-    return 0
-  fi
-
-  curl -fsSL \
-    --retry 3 --retry-delay 1 --retry-connrefused \
-    --connect-timeout 5 --max-time 25 \
-    -A "$ua" \
-    "$url" -o "$out"
-}
+# --------------------------
+# Network helpers (stable)
+# --------------------------
 
 with_proxy_if_set() {
-  # if gh_proxy is set, prepend it
-  # gh_proxy must end with / (recommended), but we handle both
+  # If gh_proxy is set, prepend it.
+  # gh_proxy recommended format: https://your-proxy/
   local url="$1"
   if [[ -n "${gh_proxy:-}" ]]; then
     local p="$gh_proxy"
@@ -126,7 +113,26 @@ with_proxy_if_set() {
   fi
 }
 
-# ---------- deps / xray ----------
+curl_fetch() {
+  # curl_fetch <url> <out_file>
+  local url="$1" out="$2"
+  local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] curl -fsSL --retry 3 --retry-delay 1 --retry-connrefused --connect-timeout 5 --max-time 25 -A '$ua' '$url' -o '$out'"
+    return 0
+  fi
+
+  curl -fsSL \
+    --retry 3 --retry-delay 1 --retry-connrefused \
+    --connect-timeout 5 --max-time 25 \
+    -A "$ua" \
+    "$url" -o "$out"
+}
+
+# --------------------------
+# Install / Update
+# --------------------------
 
 install_deps() {
   echo "==> 安装依赖..."
@@ -139,24 +145,21 @@ install_deps() {
 install_xray() {
   echo "==> 安装/更新官方 Xray..."
 
-  # ✅ 正确 raw 地址（修复 404 根因）
-  local RAW_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-
-  # 可选：你设置 gh_proxy 后，会变成：gh_proxy + RAW_URL
-  local URL="$(with_proxy_if_set "$RAW_URL")"
+  # ✅ 永远用正确 raw 地址；可选 gh_proxy 加速/代理
+  local url
+  url="$(with_proxy_if_set "$XRAY_INSTALL_RAW_URL")"
 
   local tmp="/tmp/xray-install.$RANDOM.$RANDOM.sh"
   run_cmd rm -f "$tmp" 2>/dev/null || true
 
-  echo "==> 拉取安装脚本：$URL"
-  if ! curl_fetch "$URL" "$tmp"; then
-    # 给更明确的报错提示（特别是 404/网络问题）
-    die "下载官方安装脚本失败（可能网络/代理/URL 问题）。可尝试：gh_proxy=https://你的代理/ bash xray.sh"
+  echo "==> 拉取安装脚本：$url"
+  if ! curl_fetch "$url" "$tmp"; then
+    die "下载官方安装脚本失败（网络/代理/RAW 访问问题）。可尝试：gh_proxy=https://你的代理前缀/ bash xray.sh"
   fi
 
-  # 简单 sanity check：避免下载到 HTML/错误页
+  # Sanity check：避免下载到 HTML/错误页
   if [[ "$DRY_RUN" != "1" ]]; then
-    grep -qE "Xray|install|remove" "$tmp" || {
+    grep -qE "install|remove|Xray" "$tmp" || {
       echo "==== 安装脚本内容预览(前40行) ===="
       sed -n '1,40p' "$tmp" || true
       die "安装脚本内容异常（可能被代理替换/返回了错误页）"
@@ -567,15 +570,15 @@ cmd_uninstall() {
   run_cmd rm -f "$XRAY_CONF" "$ENV_FILE"
 
   echo "==> 卸载 Xray..."
-  # 同样走正确 raw 地址 + 可选 gh_proxy
-  local RAW_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
-  local URL="$(with_proxy_if_set "$RAW_URL")"
-  local tmp="/tmp/xray-remove.$RANDOM.$RANDOM.sh"
+  # 官方卸载方式：install-release.sh remove
+  local url tmp
+  url="$(with_proxy_if_set "$XRAY_INSTALL_RAW_URL")"
+  tmp="/tmp/xray-remove.$RANDOM.$RANDOM.sh"
   run_cmd rm -f "$tmp" 2>/dev/null || true
 
-  echo "==> 拉取卸载脚本：$URL"
-  if ! curl_fetch "$URL" "$tmp"; then
-    warn "下载卸载脚本失败（可忽略）。你也可以手动删除：$XRAY_BIN 等文件"
+  echo "==> 拉取卸载脚本：$url"
+  if ! curl_fetch "$url" "$tmp"; then
+    warn "下载卸载脚本失败（可忽略）。如需手动卸载，可删除 $XRAY_BIN 等文件。"
     return 0
   fi
 
@@ -612,7 +615,9 @@ usage() {
   echo "  dry=1 bash xray.sh install"
 }
 
-# -------- main --------
+# --------------------------
+# Main
+# --------------------------
 
 first="$(parse_dry_run_flag "${1:-}")"
 if [[ "${1:-}" =~ ^(--dry-run|dry-run|-n)$ ]]; then
