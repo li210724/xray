@@ -22,6 +22,8 @@ export LC_ALL=C.UTF-8
 #   fp=chrome                 # 指纹(默认 chrome)
 #   bbr=1                     # 额外开启 BBR+fq（可选）
 #   openfw=1                  # 自动放行防火墙端口（可选）
+#   dry=1                     # dry-run（仅打印将执行动作）
+#   gh_proxy=https://xxx/     # GitHub raw 代理前缀（可选）
 #
 # Commands:
 #   bash xray.sh              # install/reinstall & print info
@@ -30,12 +32,12 @@ export LC_ALL=C.UTF-8
 #   bash xray.sh info         # print saved node info
 #   bash xray.sh status       # systemd status
 #   bash xray.sh log          # last 200 logs
-#   bash xray.sh check        # self-check (service/port/config/firewall/sni)
+#   bash xray.sh check        # self-check
 #   bash xray.sh uninstall    # remove xray + clean
+#   bash xray.sh bbr          # enable BBR+fq
 #
-# Dry-run:
+# Dry-run flag:
 #   bash xray.sh --dry-run install
-#   dry=1 bash xray.sh install
 # ==========================================================
 
 trap 'echo "ERROR: line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
@@ -52,20 +54,27 @@ PORT_MAX=60000
 
 DRY_RUN="${dry:-0}"
 
-# -------------- helpers --------------
-
 die(){ echo "ERROR: $*" >&2; exit 1; }
 warn(){ echo "WARN: $*" >&2; }
 is_root(){ [[ "${EUID:-0}" -eq 0 ]]; }
 need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
 
 run_cmd() {
-  # Use: run_cmd <command...>
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "[dry-run] $*"
     return 0
   fi
   "$@"
+}
+
+parse_dry_run_flag() {
+  case "${1:-}" in
+    --dry-run|dry-run|-n)
+      DRY_RUN="1"
+      shift || true
+      ;;
+  esac
+  echo "${1:-}"
 }
 
 is_debian_like() {
@@ -75,27 +84,8 @@ is_debian_like() {
   [[ "${ID:-}" == "debian" || "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *"debian"* ]]
 }
 
-parse_dry_run_flag() {
-  # allow: --dry-run / dry-run / -n as first arg
-  case "${1:-}" in
-    --dry-run|dry-run|-n)
-      DRY_RUN="1"
-      shift
-      ;;
-  esac
-  echo "${1:-}" # return next command token
-}
-
-valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] || return 1
-  (( $1 >= 1 && $1 <= 65535 )) || return 1
-  return 0
-}
-
-valid_uuid() {
-  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
-}
-
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
 valid_sni() {
   [[ -n "$1" ]] || return 1
   [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
@@ -103,7 +93,40 @@ valid_sni() {
   return 0
 }
 
-# -------------- install / update --------------
+# ---------- robust fetch helpers ----------
+
+curl_fetch() {
+  # curl_fetch <url> <out_file>
+  # extra stable: retry + timeout + follow redirect
+  local url="$1" out="$2"
+  local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 5 --max-time 25 -A '$ua' '$url' -o '$out'"
+    return 0
+  fi
+
+  curl -fsSL \
+    --retry 3 --retry-delay 1 --retry-connrefused \
+    --connect-timeout 5 --max-time 25 \
+    -A "$ua" \
+    "$url" -o "$out"
+}
+
+with_proxy_if_set() {
+  # if gh_proxy is set, prepend it
+  # gh_proxy must end with / (recommended), but we handle both
+  local url="$1"
+  if [[ -n "${gh_proxy:-}" ]]; then
+    local p="$gh_proxy"
+    [[ "$p" == */ ]] || p="${p}/"
+    echo "${p}${url}"
+  else
+    echo "$url"
+  fi
+}
+
+# ---------- deps / xray ----------
 
 install_deps() {
   echo "==> 安装依赖..."
@@ -115,7 +138,34 @@ install_deps() {
 
 install_xray() {
   echo "==> 安装/更新官方 Xray..."
-  run_cmd bash -c "bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/dev/null"
+
+  # ✅ 正确 raw 地址（修复 404 根因）
+  local RAW_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+
+  # 可选：你设置 gh_proxy 后，会变成：gh_proxy + RAW_URL
+  local URL="$(with_proxy_if_set "$RAW_URL")"
+
+  local tmp="/tmp/xray-install.$RANDOM.$RANDOM.sh"
+  run_cmd rm -f "$tmp" 2>/dev/null || true
+
+  echo "==> 拉取安装脚本：$URL"
+  if ! curl_fetch "$URL" "$tmp"; then
+    # 给更明确的报错提示（特别是 404/网络问题）
+    die "下载官方安装脚本失败（可能网络/代理/URL 问题）。可尝试：gh_proxy=https://你的代理/ bash xray.sh"
+  fi
+
+  # 简单 sanity check：避免下载到 HTML/错误页
+  if [[ "$DRY_RUN" != "1" ]]; then
+    grep -qE "Xray|install|remove" "$tmp" || {
+      echo "==== 安装脚本内容预览(前40行) ===="
+      sed -n '1,40p' "$tmp" || true
+      die "安装脚本内容异常（可能被代理替换/返回了错误页）"
+    }
+  fi
+
+  run_cmd bash "$tmp" >/dev/null
+  run_cmd rm -f "$tmp" 2>/dev/null || true
+
   [[ "$DRY_RUN" == "1" ]] && return 0
   [[ -x "$XRAY_BIN" ]] || die "Xray 安装失败：找不到 $XRAY_BIN"
 }
@@ -166,9 +216,6 @@ gen_reality_keys() {
   local KEYS PRIVATE_KEY PUBLIC_KEY
   KEYS="$("$XRAY_BIN" x25519 2>/dev/null || true)"
 
-  # 兼容两种输出：
-  # 新：PrivateKey: xxx  Password: yyy
-  # 旧：Private key: xxx Public key: yyy
   PRIVATE_KEY="$(echo "$KEYS" | awk -F'[: ]+' '/PrivateKey|Private key/ {print $2; exit}')"
   PUBLIC_KEY="$(echo "$KEYS"  | awk -F'[: ]+' '/Password|Public key/ {print $2; exit}')"
 
@@ -180,7 +227,7 @@ gen_reality_keys() {
 
   PRIVATE_KEY_R="$PRIVATE_KEY"
   PUBLIC_KEY_R="$PUBLIC_KEY"
-  SHORT_ID="$(openssl rand -hex 4)" # 8 hex chars
+  SHORT_ID="$(openssl rand -hex 4)"
 }
 
 get_public_ip() {
@@ -189,12 +236,10 @@ get_public_ip() {
   [[ -n "$ip" ]] || ip="$(curl -4 -s --max-time 3 https://ifconfig.me 2>/dev/null || true)"
   [[ -n "$ip" ]] || ip="$(curl -4 -s --max-time 3 https://icanhazip.com 2>/dev/null || true)"
   ip="${ip//$'\n'/}"
-
   if [[ -z "$ip" ]]; then
     ip="$(curl -6 -s --max-time 3 https://api64.ipify.org 2>/dev/null || true)"
     ip="${ip//$'\n'/}"
   fi
-
   echo "$ip"
 }
 
@@ -234,10 +279,7 @@ write_config() {
           "shortIds": ["${SHORT_ID}"]
         }
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http","tls","quic"]
-      }
+      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"] }
     },
     {
       "tag": "vless-in-6",
@@ -262,10 +304,7 @@ write_config() {
           "shortIds": ["${SHORT_ID}"]
         }
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http","tls","quic"]
-      }
+      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"] }
     }
   ],
   "outbounds": [
@@ -314,8 +353,6 @@ load_env() {
   source "$ENV_FILE"
 }
 
-# -------------- info / output --------------
-
 print_info() {
   load_env
   [[ -n "${PORT:-}" && -n "${UUID:-}" && -n "${PUBLIC_KEY:-}" && -n "${SHORT_ID:-}" && -n "${SNI:-}" ]] \
@@ -359,8 +396,6 @@ YAML
   echo "注意：请确保云安全组/防火墙已放行 TCP ${PORT}"
 }
 
-# -------------- performance / firewall --------------
-
 enable_bbr_fq() {
   echo "==> 开启 BBR + fq..."
   run_cmd modprobe tcp_bbr 2>/dev/null || true
@@ -383,22 +418,17 @@ open_firewall_port() {
   [[ "${openfw:-0}" == "1" ]] || return 0
   echo "==> 尝试自动放行防火墙端口 TCP ${PORT}..."
 
-  # UFW
   if command -v ufw >/dev/null 2>&1; then
-    # ufw 可能未启用，但 allow 也没坏处
     run_cmd ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
   fi
 
-  # firewalld
   if command -v firewall-cmd >/dev/null 2>&1; then
     if run_cmd firewall-cmd --state >/dev/null 2>&1; then
-      # runtime + permanent
       run_cmd firewall-cmd --add-port="${PORT}/tcp" >/dev/null 2>&1 || true
       run_cmd firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1 || true
     fi
   fi
 
-  # iptables (仅追加，不做复杂判断)
   if command -v iptables >/dev/null 2>&1; then
     if [[ "$DRY_RUN" == "1" ]]; then
       echo "[dry-run] iptables allow tcp dport ${PORT}"
@@ -411,8 +441,6 @@ open_firewall_port() {
   echo "==> 完成（如使用云厂商安全组，还需在控制台放行）"
 }
 
-# -------------- commands --------------
-
 cmd_install() {
   is_root || die "请用 root 运行"
   need_cmd systemctl
@@ -424,7 +452,6 @@ cmd_install() {
 
   SNI="${reym:-$REYM_DEFAULT}"
   valid_sni "$SNI" || die "reym/SNI 看起来不合法：$SNI"
-
   FP="${fp:-$FP_DEFAULT}"
 
   gen_uuid
@@ -449,13 +476,10 @@ cmd_install() {
 cmd_update() {
   is_root || die "请用 root 运行"
   need_cmd systemctl
-
-  [[ "$DRY_RUN" == "1" ]] && echo "==> (dry-run) 将更新 Xray 内核但不修改配置..."
-
   [[ -x "$XRAY_BIN" || "$DRY_RUN" == "1" ]] || die "未检测到已安装的 Xray，请先 install"
 
   echo "==> 更新 Xray 内核（不修改任何配置）..."
-  run_cmd bash -c "bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) >/dev/null"
+  install_xray
 
   echo "==> 重启 Xray 服务..."
   run_cmd systemctl restart "$SERVICE"
@@ -471,8 +495,6 @@ cmd_check() {
   need_cmd ss
 
   load_env
-  [[ -f "$XRAY_CONF" ]] || warn "未找到配置：$XRAY_CONF"
-  [[ -f "$ENV_FILE"  ]] || warn "未找到信息文件：$ENV_FILE"
 
   echo "==> [1/6] systemd 状态"
   systemctl --no-pager -l status "$SERVICE" | sed -n '1,14p' || true
@@ -494,17 +516,16 @@ cmd_check() {
   fi
   echo
 
-  echo "==> [4/6] SNI 出站连通性（仅检查能否连到 SNI:443，不等于 Reality 握手）"
+  echo "==> [4/6] SNI 出站连通性（仅检查 TCP connect SNI:443）"
   if [[ -n "${SNI:-}" ]]; then
-    # bash /dev/tcp 测试（最通用）
     timeout 4 bash -c "cat < /dev/null > /dev/tcp/${SNI}/443" 2>/dev/null \
-      && echo "OK: TCP connect ${SNI}:443" || warn "FAIL: 无法 TCP connect ${SNI}:443（可能 DNS/出站限制/被墙）"
+      && echo "OK: TCP connect ${SNI}:443" || warn "FAIL: 无法 TCP connect ${SNI}:443（DNS/出站限制/被墙/代理问题）"
   else
     warn "ENV 中没有 SNI，跳过"
   fi
   echo
 
-  echo "==> [5/6] 防火墙状态（仅展示，不做修改）"
+  echo "==> [5/6] 防火墙状态（只读）"
   if command -v ufw >/dev/null 2>&1; then
     echo "-- ufw --"
     ufw status 2>/dev/null || true
@@ -537,6 +558,7 @@ cmd_check() {
 
 cmd_uninstall() {
   is_root || die "请用 root 运行"
+
   echo "==> 停止服务..."
   run_cmd systemctl stop "$SERVICE" 2>/dev/null || true
   run_cmd systemctl disable "$SERVICE" 2>/dev/null || true
@@ -545,36 +567,53 @@ cmd_uninstall() {
   run_cmd rm -f "$XRAY_CONF" "$ENV_FILE"
 
   echo "==> 卸载 Xray..."
-  run_cmd bash -c "curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- remove" || true
+  # 同样走正确 raw 地址 + 可选 gh_proxy
+  local RAW_URL="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+  local URL="$(with_proxy_if_set "$RAW_URL")"
+  local tmp="/tmp/xray-remove.$RANDOM.$RANDOM.sh"
+  run_cmd rm -f "$tmp" 2>/dev/null || true
+
+  echo "==> 拉取卸载脚本：$URL"
+  if ! curl_fetch "$URL" "$tmp"; then
+    warn "下载卸载脚本失败（可忽略）。你也可以手动删除：$XRAY_BIN 等文件"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] bash '$tmp' remove"
+    return 0
+  fi
+
+  bash "$tmp" remove >/dev/null 2>&1 || bash "$tmp" -s -- remove >/dev/null 2>&1 || true
+  rm -f "$tmp" 2>/dev/null || true
 
   echo "==> 卸载完成"
 }
 
 usage() {
   echo "用法："
-  echo "  bash xray.sh                     # 一键安装/重装并输出信息"
-  echo "  bash xray.sh install             # 同上"
-  echo "  bash xray.sh update              # 仅更新 Xray 内核，不改配置/不改客户端"
-  echo "  bash xray.sh info                # 仅输出节点信息"
-  echo "  bash xray.sh status              # 查看服务状态"
-  echo "  bash xray.sh log                 # 查看最近200行日志"
-  echo "  bash xray.sh check               # 自检（服务/端口/配置/日志/SNI/防火墙）"
-  echo "  bbr=1 bash xray.sh               # 安装时顺便开启 BBR+fq"
-  echo "  openfw=1 bash xray.sh            # 安装时尝试自动放行防火墙端口"
-  echo "  bash xray.sh bbr                 # 单独开启 BBR+fq"
-  echo "  bash xray.sh uninstall           # 卸载"
-  echo
-  echo "Dry-run："
-  echo "  bash xray.sh --dry-run install   # 只打印将执行动作，不改系统"
-  echo "  dry=1 bash xray.sh install       # 同上"
+  echo "  bash xray.sh              # 一键安装/重装并输出信息"
+  echo "  bash xray.sh install      # 同上"
+  echo "  bash xray.sh update       # 仅更新 Xray 内核，不改配置"
+  echo "  bash xray.sh info         # 输出节点信息"
+  echo "  bash xray.sh status       # 查看服务状态"
+  echo "  bash xray.sh log          # 查看最近200行日志"
+  echo "  bash xray.sh check        # 自检（服务/端口/配置/日志/SNI/防火墙）"
+  echo "  bbr=1 bash xray.sh        # 安装时顺便开启 BBR+fq"
+  echo "  bash xray.sh bbr          # 单独开启 BBR+fq"
+  echo "  bash xray.sh uninstall    # 卸载"
   echo
   echo "可选变量："
-  echo "  reym=www.tesla.com vlpt=443 uuid=xxx fp=chrome openfw=1 bbr=1 bash xray.sh"
+  echo "  reym=xxx vlpt=443 uuid=xxx fp=chrome openfw=1 bbr=1 bash xray.sh"
+  echo "  gh_proxy=https://xxx/ bash xray.sh   # 可选：raw 加速/代理前缀"
+  echo
+  echo "Dry-run："
+  echo "  bash xray.sh --dry-run install"
+  echo "  dry=1 bash xray.sh install"
 }
 
-# -------------- main --------------
+# -------- main --------
 
-# Parse dry-run flag as first token if present
 first="$(parse_dry_run_flag "${1:-}")"
 if [[ "${1:-}" =~ ^(--dry-run|dry-run|-n)$ ]]; then
   shift || true
